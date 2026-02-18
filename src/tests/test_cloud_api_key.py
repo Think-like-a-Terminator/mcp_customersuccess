@@ -19,7 +19,7 @@ from typing import Optional
 
 
 # Your deployed Cloud Run URL
-SERVER_URL = "https://customer-success-mcp-316962419897.us-central1.run.app"
+SERVER_URL = "https://your-mcp-server-url.run.app"
 
 
 async def test_health_endpoint():

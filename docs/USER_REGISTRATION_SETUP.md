@@ -119,7 +119,7 @@ register_user(
 
 User receives an email with a verification link:
 ```
-https://customer-success-mcp-316962419897.us-central1.run.app/verify?token=ABC123XYZ...
+https://your-mcp-server-url.run.app/verify?token=ABC123XYZ...
 ```
 
 Or use the MCP tool directly:

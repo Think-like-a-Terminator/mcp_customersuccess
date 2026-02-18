@@ -6,7 +6,7 @@ import sys
 from typing import Any, Dict
 
 # Your Cloud Run URL
-SERVICE_URL = "https://customer-success-mcp-316962419897.us-central1.run.app"
+SERVICE_URL = "https://your-mcp-server-url.run.app"
 
 
 class CloudMCPClient:

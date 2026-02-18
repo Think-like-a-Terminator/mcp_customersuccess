@@ -463,7 +463,7 @@ Use MCP Inspector or Claude Desktop with your admin key to generate keys for cli
 ```bash
 # Launch MCP Inspector with admin key
 npx @modelcontextprotocol/inspector sse \
-  https://customer-success-mcp-316962419897.us-central1.run.app/sse \
+  https://your-mcp-server-url.run.app/sse \
   --header "X-API-Key: csm_live_YourAdminKeyHere"
 
 # Then use the generate_api_key tool
@@ -492,7 +492,7 @@ Add the API key to your client configurations:
 MCP_SERVERS: |
   {
     "customer-success": {
-      "url": "https://customer-success-mcp-316962419897.us-central1.run.app",
+      "url": "https://your-mcp-server-url.run.app",
       "transport": "sse",
       "headers": {
         "X-API-Key": "csm_live_YourClientKeyHere"
@@ -508,7 +508,7 @@ MCP_SERVERS: |
 {
   "mcpServers": {
     "customer-success": {
-      "url": "https://customer-success-mcp-316962419897.us-central1.run.app",
+      "url": "https://your-mcp-server-url.run.app",
       "transport": "sse",
       "headers": {
         "X-API-Key": "csm_live_YourClientKeyHere"
@@ -522,11 +522,11 @@ MCP_SERVERS: |
 
 ```bash
 # Test without API key (should fail with 401)
-curl https://customer-success-mcp-316962419897.us-central1.run.app/sse
+curl https://your-mcp-server-url.run.app/sse
 
 # Test with valid API key (should succeed)
 curl -H "X-API-Key: csm_live_YourAPIKeyHere" \
-     https://customer-success-mcp-316962419897.us-central1.run.app/sse
+     https://your-mcp-server-url.run.app/sse
 
 # Or use the automated test script
 python test_cloud_api_key.py csm_live_YourAPIKeyHere

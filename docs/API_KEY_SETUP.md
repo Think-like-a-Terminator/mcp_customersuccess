@@ -100,7 +100,7 @@ Edit your LibreChat environment configuration:
 MCP_SERVERS: |
   {
     "customer-success": {
-      "url": "https://customer-success-mcp-316962419897.us-central1.run.app",
+      "url": "https://your-mcp-server-url.run.app",
       "transport": "sse",
       "headers": {
         "X-API-Key": "csm_live_AbCdEfGhIjKlMnOpQrStUvWxYz123456"
@@ -114,7 +114,7 @@ MCP_SERVERS: |
 ```bash
 # Launch MCP Inspector with API key header
 npx @modelcontextprotocol/inspector sse \
-  https://customer-success-mcp-316962419897.us-central1.run.app \
+  https://your-mcp-server-url.run.app \
   --header "X-API-Key: csm_live_AbCdEfGhIjKlMnOpQrStUvWxYz123456"
 ```
 
@@ -126,7 +126,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "customer-success": {
-      "url": "https://customer-success-mcp-316962419897.us-central1.run.app",
+      "url": "https://your-mcp-server-url.run.app",
       "transport": "sse",
       "headers": {
         "X-API-Key": "csm_live_AbCdEfGhIjKlMnOpQrStUvWxYz123456"
@@ -150,13 +150,13 @@ headers = {
 async with httpx.AsyncClient() as client:
     # Check health (no auth required)
     response = await client.get(
-        "https://customer-success-mcp-316962419897.us-central1.run.app/health"
+        "https://your-mcp-server-url.run.app/health"
     )
     print(response.json())
     
     # Connect to SSE endpoint (auth required)
     response = await client.get(
-        "https://customer-success-mcp-316962419897.us-central1.run.app/sse",
+        "https://your-mcp-server-url.run.app/sse",
         headers=headers
     )
 ```
@@ -165,11 +165,11 @@ async with httpx.AsyncClient() as client:
 
 ```bash
 # Test health endpoint (no auth)
-curl https://customer-success-mcp-316962419897.us-central1.run.app/health
+curl https://your-mcp-server-url.run.app/health
 
 # Test SSE endpoint with API key
 curl -H "X-API-Key: csm_live_AbCdEfGhIjKlMnOpQrStUvWxYz123456" \
-     https://customer-success-mcp-316962419897.us-central1.run.app/sse
+     https://your-mcp-server-url.run.app/sse
 ```
 
 ## Step 3: Manage API Keys
@@ -482,14 +482,14 @@ curl -H "X-API-Key: <your-key>" http://localhost:8000/sse
 
 ```bash
 # Test health (no auth)
-curl https://customer-success-mcp-316962419897.us-central1.run.app/health
+curl https://your-mcp-server-url.run.app/health
 
 # Test SSE with valid key (should work)
 curl -H "X-API-Key: csm_live_..." \
-     https://customer-success-mcp-316962419897.us-central1.run.app/sse
+     https://your-mcp-server-url.run.app/sse
 
 # Test SSE without key (should fail with 401)
-curl https://customer-success-mcp-316962419897.us-central1.run.app/sse
+curl https://your-mcp-server-url.run.app/sse
 ```
 
 ### 3. MCP Inspector Testing
@@ -500,7 +500,7 @@ npm install -g @modelcontextprotocol/inspector
 
 # Launch with API key
 npx @modelcontextprotocol/inspector sse \
-  https://customer-success-mcp-316962419897.us-central1.run.app \
+  https://your-mcp-server-url.run.app \
   --header "X-API-Key: csm_live_..."
 
 # Access at: http://localhost:6274
