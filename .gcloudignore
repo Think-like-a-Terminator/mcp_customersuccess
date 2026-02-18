@@ -1,0 +1,42 @@
+# This file specifies files that are *not* uploaded to Google Cloud
+# using gcloud. It follows the same syntax as .gitignore
+
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Testing
+.pytest_cache/
+test_*.py
+
+# Environment
+.env
+.env.local
+
+# Documentation (except README.md which is needed for package metadata)
+DEPLOYMENT.md
+POSTGRESQL_TOOLS.md
+POSTGRESQL_QUICKSTART.md
+QUICKSTART_DEPLOY.md
+DOCKER_TROUBLESHOOTING.md
+ROI_REPORT_TOOL.md
+
+# Lock files
+uv.lock

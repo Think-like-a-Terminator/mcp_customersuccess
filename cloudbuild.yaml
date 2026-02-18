@@ -1,0 +1,84 @@
+# Google Cloud Build configuration for automatic deployment
+
+steps:
+  # Step 1: Build the Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/customer-success-mcp:$_VERSION'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/customer-success-mcp:latest'
+      - '.'
+    id: 'build-image'
+
+  # Step 2: Push the Docker image to Google Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/customer-success-mcp:$_VERSION'
+    id: 'push-image-sha'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/customer-success-mcp:latest'
+    id: 'push-image-latest'
+
+  # Step 3: Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'customer-success-mcp'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/customer-success-mcp:$_VERSION'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--memory'
+      - '1Gi'
+      - '--cpu'
+      - '1'
+      - '--timeout'
+      - '300'
+      - '--min-instances'
+      - '1'
+      - '--max-instances'
+      - '1'
+      - '--set-env-vars'
+      - 'POSTGRES_HOST=$_POSTGRES_HOST,POSTGRES_PORT=$_POSTGRES_PORT,POSTGRES_DB=$_POSTGRES_DB,POSTGRES_USER=$_POSTGRES_USER'
+      - '--update-secrets'
+      - 'POSTGRES_PASSWORD=$_POSTGRES_PASSWORD_SECRET:latest,JWT_SECRET_KEY=$_JWT_SECRET_KEY_SECRET:latest'
+    id: 'deploy-cloud-run'
+
+# Store images in Google Container Registry
+images:
+  - 'gcr.io/$PROJECT_ID/customer-success-mcp:$_VERSION'
+  - 'gcr.io/$PROJECT_ID/customer-success-mcp:latest'
+
+# Substitutions - provides default values for manual builds
+substitutions:
+  _VERSION: 'latest'
+  # PostgreSQL connection settings (non-sensitive, passed as env vars)
+  # For Cloud SQL, use the private IP or Cloud SQL Proxy socket path
+  _POSTGRES_HOST: '127.0.0.1'
+  _POSTGRES_PORT: '5432'
+  _POSTGRES_DB: 'customer_success'
+  _POSTGRES_USER: 'postgres'
+  # Sensitive values — store in Secret Manager and reference by secret name
+  # Create with: gcloud secrets create POSTGRES_PASSWORD --data-file=-
+  _POSTGRES_PASSWORD_SECRET: 'POSTGRES_PASSWORD'
+  _JWT_SECRET_KEY_SECRET: 'JWT_SECRET_KEY'
+
+# Build configuration
+options:
+  machineType: 'N1_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY
+  substitution_option: 'ALLOW_LOOSE'
+
+# Timeout
+timeout: '1200s'
