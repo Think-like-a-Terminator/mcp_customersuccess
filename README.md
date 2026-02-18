@@ -47,9 +47,9 @@ A Model Context Protocol (MCP) server that provides customer success management 
 
 ### Setup
 
-1. **Clone or navigate to the project directory:**
-   ```bash
-   cd /Users/briany/Documents/csmcp
+1. **Clone project directory:**
+   ```
+   git clone https://github.com/Think-like-a-Terminator/mcp_customersuccess.git
    ```
 
 2. **Install dependencies using uv:**
@@ -91,7 +91,7 @@ A Model Context Protocol (MCP) server that provides customer success management 
      - `POSTGRES_USER`: Database user, default `postgres`
      - `POSTGRES_PASSWORD`: Database password
    - `JWT_SECRET_KEY`: Change to a secure random string
-   - AWS SES credentials (optional, for survey email features)
+   - AWS SES credentials (optional, for verification emails)
    - SMTP credentials (optional, for verification emails)
 
 ## Usage
@@ -114,7 +114,7 @@ Add to your Claude Desktop configuration (`~/Library/Application Support/Claude/
       "command": "uv",
       "args": [
         "--directory",
-        "/Users/briany/Documents/dfenterprisemcp",
+        "your-project-directory",
         "run",
         "python",
         "-m",
@@ -149,7 +149,7 @@ Create `.vscode/mcp.json`:
       "command": "uv",
       "args": [
         "--directory",
-        "/Users/briany/Documents/csmcp",
+        "your-project-directory",
         "run",
         "python",
         "-m",
