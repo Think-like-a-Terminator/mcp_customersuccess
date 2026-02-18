@@ -42,7 +42,7 @@ A Model Context Protocol (MCP) server that provides customer success management 
 ### Prerequisites
 - Python 3.10 or higher
 - **PostgreSQL 14+** — either [Google Cloud SQL](https://cloud.google.com/sql/docs/postgres) for production or a local instance for development
-- AWS account with SES configured (optional, for NPS survey email features)
+- AWS account with SES configured (optional, for user registration email verification)
 - `uv` package manager (recommended) or `pip`
 
 ### Setup
