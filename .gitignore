@@ -51,3 +51,4 @@ Thumbs.db
 github_sshkey
 github_sshkey.pub
 admin_api_key.key
+cloud-sql-proxy
