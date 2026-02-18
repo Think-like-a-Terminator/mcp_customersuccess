@@ -60,11 +60,8 @@ A complete self-service user registration system with email verification and Pos
 - authenticate
 - create_call_to_action, list_call_to_actions, update_call_to_action
 - update_health_score, get_health_score, list_health_scores
-- send_survey_email, record_survey_response
 - create_risk_alert, list_risk_alerts, update_risk_alert
 - query_database, test_database_connection, get_database_tables, get_table_schema
-- send_roi_report
-- And more...
 
 ## 📊 Database Schema
 

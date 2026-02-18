@@ -267,16 +267,15 @@ curl https://your-service-url/health
 ```bash
 gcloud run services update customer-success-mcp \
   --min-instances=1 \
-  --max-instances=10 \
-  --concurrency=80
+  --max-instances=1 \
 ```
 
 **GKE:**
 ```bash
 kubectl autoscale deployment customer-success-mcp \
   --cpu-percent=70 \
-  --min=2 \
-  --max=10
+  --min=1 \
+  --max=1
 ```
 
 ### Custom Domain
