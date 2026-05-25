@@ -1,7 +1,12 @@
 """Customer Success MCP Server - Main server implementation."""
 
 import asyncio
+import logging
+import os
+import secrets
 import sys
+import time
+import weakref
 from datetime import datetime, timedelta
 from typing import Any, Optional
 import uuid
@@ -23,17 +28,59 @@ from src.models import (
     RiskLevel,
     Token,
 )
-from src.storage import data_store
+
 from src.mcp_storage import mcp_storage
 from src.api_key_service import APIKeyService
+from src.oauth_service import oauth_service
+from src.db_service import db_service
+from src.user_service import UserService
+from src.slack_service import slack_service
 
 # Context variable to store API key info for current request
 api_key_context: ContextVar[Optional[dict]] = ContextVar('api_key_context', default=None)
-from src.db_service import db_service
-from src.user_service import UserService
+# Context variable to track SSE session_id for the current request
+session_id_context: ContextVar[Optional[str]] = ContextVar('session_id_context', default=None)
+
+# ── Session auth state ───────────────────────────────────────────────────────
+# TTL constants
+_SESSION_AUTH_TTL = 120 * 3600        # 120 hours/5 days — session auth expires
+_PENDING_AUTH_REQUEST_TTL = 600     # 10 minutes — auth request link expires
+
+# Map session_key (id of MCP session object) -> {username, scopes, created_at, session_ref}
+_session_auth: dict[int, dict] = {}
+# Map auth_request_id -> {session_key, session_ref, created_at}
+_pending_auth_requests: dict[str, dict] = {}
+
+
+def _cleanup_expired_auth():
+    """Remove expired entries from _session_auth and _pending_auth_requests."""
+    now = time.time()
+    # Clean expired sessions (TTL or dead weakrefs)
+    expired_sessions = [
+        k for k, v in _session_auth.items()
+        if (now - v.get('created_at', 0) > _SESSION_AUTH_TTL)
+        or (v.get('session_ref') is not None and v['session_ref']() is None)
+    ]
+    for k in expired_sessions:
+        del _session_auth[k]
+    if expired_sessions:
+        logger.info(f"[LAZY-AUTH] Cleaned up {len(expired_sessions)} expired session(s)")
+
+    # Clean expired pending auth requests
+    expired_pending = [
+        k for k, v in _pending_auth_requests.items()
+        if now - v.get('created_at', 0) > _PENDING_AUTH_REQUEST_TTL
+    ]
+    for k in expired_pending:
+        del _pending_auth_requests[k]
+    if expired_pending:
+        logger.info(f"[LAZY-AUTH] Cleaned up {len(expired_pending)} expired auth request(s)")
+
 
 # Initialize services
 user_service = UserService()
+
+logger = logging.getLogger(__name__)
 
 # Initialize FastMCP server
 mcp = FastMCP(
@@ -59,341 +106,66 @@ mcp = FastMCP(
 # ============================================================================
 
 @mcp.tool()
-def authenticate(username: str, password: str) -> dict[str, Any]:
+def check_auth_status() -> dict[str, Any]:
     """
-    Authenticate a user and receive an access token.
+    Check whether this session has been authenticated.
     
-    Default users (change passwords in production!):
-    - username: admin, password: admin123 (full access)
-    - username: csm, password: csm123 (read/write access)
-    
-    Args:
-        username: Username for authentication
-        password: Password for authentication
+    After the user completes OAuth sign-in in the browser, their session is
+    automatically activated. Call this tool to verify the session is ready.
     
     Returns:
-        Authentication token and user information
+        Authentication status for the current session
     """
-    user = authenticate_user(username, password)
-    if not user:
-        return {
-            "success": False,
-            "error": "Invalid username or password",
+    # Run cleanup on each check
+    _cleanup_expired_auth()
+    try:
+        ctx = mcp.get_context()
+        session_obj = ctx.session
+        session_key = id(session_obj)
+        if session_key in _session_auth:
+            info = _session_auth[session_key]
+            # Verify session object is still alive via weakref
+            ref = info.get('session_ref')
+            if ref is not None and ref() is None:
+                del _session_auth[session_key]
+            else:
+                return {
+                    "success": True,
+                    "authenticated": True,
+                    "message": f"Session is authenticated as {info['username']}. All tools are available.",
+                    "username": info['username'],
+                }
+    except Exception:
+        pass
+    _oauth_url = os.getenv('OAUTH_PUBLIC_BASE_URL', 'http://localhost:8000').rstrip('/')
+    auth_request_id = secrets.token_urlsafe(16)
+    try:
+        ctx = mcp.get_context()
+        session_obj = ctx.session
+        session_key = id(session_obj)
+        _pending_auth_requests[auth_request_id] = {
+            'session_key': session_key,
+            'session_ref': weakref.ref(session_obj),
+            'created_at': time.time(),
         }
-    
-    access_token = create_access_token(
-        data={"sub": user.username, "scopes": user.scopes}
-    )
-    
+        logger.info(f"[AUTH] check_auth_status: pending auth created for session={session_key}, req={auth_request_id[:12]}...")
+    except Exception:
+        pass
+    sign_in_url = f"{_oauth_url}/authorize?auth_request_id={auth_request_id}"
+    logger.info(f"[AUTH] check_auth_status: authentication required, sign-in URL: {sign_in_url}")
     return {
-        "success": True,
-        "access_token": access_token,
-        "token_type": "bearer",
-        "user": user.dict(),
-        "expires_in": settings.access_token_expire_minutes * 60,
+        "success": False,
+        "authenticated": False,
+        "error": "authentication_required",
+        "message": (
+            "🔐 Authentication is required for this session.\n\n"
+            f"Please ask the user to open this link to sign in:\n{sign_in_url}\n\n"
+            "Once they complete sign-in in the browser, their session will be "
+            "automatically activated. Call this tool again after they confirm "
+            "they have signed in."
+        ),
+        "sign_in_url": sign_in_url,
     }
-
-
-@mcp.tool()
-def register_user(
-    admin_email: str,
-    admin_password: str,
-    username: str,
-    email: str,
-    password: str,
-    full_name: Optional[str] = None,
-    admin: bool = False,
-    send_verification_email: bool = True,
-) -> dict[str, Any]:
-    """
-    Register a new user account (admin only).
-    
-    ⚠️ ADMIN ONLY: Requires admin email and password to authenticate.
-    Admin credentials are verified against the database.
-    
-    Creates a new user account and optionally sends a verification email.
-    Verification emails are sent via SMTP or AWS SES if configured.
-    If no email provider is configured, registration still succeeds but
-    no verification email is sent.
-    
-    Args:
-        admin_email: Admin's email address (must exist in users table with admin=true)
-        admin_password: Admin's password
-        username: Desired username (must be unique, min 3 characters)
-        email: Email address (must be unique and valid)
-        password: Password (min 8 characters)
-        full_name: Optional full name
-        admin: Whether to grant admin privileges to the new user (default False)
-        send_verification_email: Whether to send a verification email (default True,
-            requires SMTP or AWS SES to be configured)
-    
-    Returns:
-        Registration status, user information, and verification email status
-    
-    Example:
-        register_user(
-            admin_email="admin@company.com",
-            admin_password="admin_password",
-            username="newuser",
-            email="newuser@company.com",
-            password="userpassword123",
-            full_name="New User",
-            admin=False
-        )
-    """
-    try:
-        from src.config import settings
-
-        # Verify admin credentials against Cloud SQL database
-        admin_check = user_service.verify_admin(admin_email, admin_password)
-        if not admin_check["success"]:
-            return {
-                "success": False,
-                "error": admin_check.get("error", "Admin authentication failed")
-            }
-        
-        result = user_service.register_user(
-            username=username,
-            email=email,
-            password=password,
-            full_name=full_name,
-            admin=admin,
-            send_verification_email=send_verification_email,
-        )
-        
-        return {
-            "success": True,
-            "registered_by": admin_check.get("username", admin_email),
-            **result,
-        }
-    
-    except ValueError as e:
-        return {
-            "success": False,
-            "error": str(e),
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Registration failed: {str(e)}",
-        }
-
-
-@mcp.tool()
-def update_user(
-    admin_email: str,
-    admin_password: str,
-    username: str,
-    email: Optional[str] = None,
-    password: Optional[str] = None,
-    full_name: Optional[str] = None,
-    disabled: Optional[bool] = None,
-    admin: Optional[bool] = None,
-) -> dict[str, Any]:
-    """
-    Update an existing user's attributes (admin only).
-    
-    ⚠️ ADMIN ONLY: Requires admin email and password to authenticate.
-    Admin credentials are verified against the Cloud SQL database.
-    
-    Only provide the fields you want to update. Fields not provided will remain unchanged.
-    
-    Args:
-        admin_email: Admin's email address (must exist in users table with admin=true)
-        admin_password: Admin's password
-        username: Username of the user to update (required - identifies the user)
-        email: New email address (optional)
-        password: New password - will be hashed (optional)
-        full_name: New full name (optional)
-        disabled: Set disabled status - true to disable, false to enable (optional)
-        admin: Set admin status - true to grant admin, false to revoke (optional)
-    
-    Returns:
-        Update status and updated user information
-    
-    Example:
-        update_user(
-            admin_email="admin@company.com",
-            admin_password="admin_password",
-            username="existinguser",
-            email="newemail@company.com",
-            disabled=False,
-            admin=True
-        )
-    """
-    try:
-        # Verify admin credentials against Cloud SQL database
-        admin_check = user_service.verify_admin(admin_email, admin_password)
-        if not admin_check["success"]:
-            return {
-                "success": False,
-                "error": admin_check.get("error", "Admin authentication failed")
-            }
-        
-        result = user_service.update_user(
-            username=username,
-            email=email,
-            password=password,
-            full_name=full_name,
-            disabled=disabled,
-            admin=admin,
-        )
-        
-        return {
-            "success": True,
-            "updated_by": admin_check.get("username", admin_email),
-            **result,
-        }
-    
-    except ValueError as e:
-        return {
-            "success": False,
-            "error": str(e),
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Update failed: {str(e)}",
-        }
-
-
-@mcp.tool()
-def verify_user_email(token: str) -> dict[str, Any]:
-    """
-    Verify a user's email address using the token from their verification email.
-    
-    Args:
-        token: Verification token from the email
-    
-    Returns:
-        Verification status
-    """
-    try:
-        result = user_service.verify_email(token)
-        
-        return {
-            "success": True,
-            **result,
-        }
-    
-    except ValueError as e:
-        return {
-            "success": False,
-            "error": str(e),
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Verification failed: {str(e)}",
-        }
-
-
-@mcp.tool()
-def resend_verification_email(email: str) -> dict[str, Any]:
-    """
-    Resend verification email to a user.
-    
-    Useful if the original verification email was not received or expired.
-    Requires SMTP or AWS SES to be configured.
-    
-    Args:
-        email: User's email address
-    
-    Returns:
-        Status of the email resend
-    """
-    try:
-        from src.email_service import email_service
-        
-        if not email_service.is_configured:
-            return {
-                "success": False,
-                "error": "No email provider configured. Set SMTP_HOST or AWS credentials.",
-            }
-        
-        # Generate new token via user_service
-        result = user_service.resend_verification_email(email)
-        
-        if not result.get("success"):
-            return result
-        
-        # Send the email with the new token
-        token = result.get("token")
-        username = result.get("username", "User")
-        
-        send_result = email_service.send_verification_email(
-            to_email=email,
-            username=username,
-            verification_token=token,
-        )
-        
-        return {
-            "success": send_result["success"],
-            "message": "Verification email sent! Check your inbox." if send_result["success"] else "Failed to send email.",
-            "provider": send_result.get("provider"),
-            "error": send_result.get("error"),
-        }
-    
-    except ValueError as e:
-        return {
-            "success": False,
-            "error": str(e),
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Failed to resend verification email: {str(e)}",
-        }
-
-
-@mcp.tool()
-def list_users(
-    admin_email: str,
-    admin_password: str,
-    admin_only: bool = False
-) -> dict[str, Any]:
-    """
-    List all registered users (admin only).
-    
-    ⚠️ ADMIN ONLY: Requires admin email and password to authenticate.
-    Admin credentials are verified against the Cloud SQL database.
-    Passwords are never returned in the response.
-    
-    Args:
-        admin_email: Admin's email address (must exist in users table with admin=true)
-        admin_password: Admin's password
-        admin_only: If True, only return users with admin privileges
-    
-    Returns:
-        List of users with their information
-    
-    Example:
-        list_users(admin_email="admin@company.com", admin_password="your_password")
-        list_users(admin_email="admin@company.com", admin_password="your_password", admin_only=True)
-    """
-    try:
-        # Verify admin credentials against Cloud SQL database
-        admin_check = user_service.verify_admin(admin_email, admin_password)
-        if not admin_check["success"]:
-            return {
-                "success": False,
-                "error": admin_check.get("error", "Admin authentication failed")
-            }
-        
-        users = user_service.list_users(admin_only=admin_only)
-        
-        return {
-            "success": True,
-            "count": len(users),
-            "users": users,
-        }
-    
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Failed to list users: {str(e)}",
-        }
-
 
 
 
@@ -740,11 +512,23 @@ def create_risk_alert(
         )
         
         created_alert = mcp_storage.create_risk_alert(alert)
-        
+
+        # Fire-and-forget Slack notification for medium/high alerts
+        if risk_level.lower() in ("medium", "high") and slack_service.is_configured:
+            slack_service.notify_risk_alert(
+                account_id=account_id,
+                risk_level=risk_level,
+                risk_factors=risk_factors,
+                impact_score=impact_score,
+                recommended_actions=recommended_actions or [],
+                alert_id=created_alert.id,
+            )
+
         return {
             "success": True,
             "alert": created_alert.dict(),
             "message": f"Risk alert created with ID: {created_alert.id}",
+            "slack_notified": risk_level.lower() in ("medium", "high") and slack_service.is_configured,
         }
     
     except Exception as e:
@@ -861,15 +645,12 @@ def get_risk_alert(alert_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 def query_database(
-    username: str,
     query: str,
     fetch_results: bool = True,
     max_rows: int = 10000,
 ) -> dict[str, Any]:
     """
     Execute a READ-ONLY SQL query against the PostgreSQL database.
-    
-    Ask for the username as an argument as only registered users in the database can use this tool.
     
     This tool allows ONLY SELECT queries for reading data. All write operations
     (INSERT, UPDATE, DELETE, MERGE) are blocked for security.
@@ -893,7 +674,6 @@ def query_database(
     - Large datasets: "SELECT COUNT(*) as total FROM large_table" (use aggregations!)
     
     Args:
-        username: Username of registered user
         query: SQL query to execute (SELECT statements only)
         fetch_results: Whether to return query results (should be True for SELECT)
         max_rows: Maximum rows to return (default: 10000, max: 10000)
@@ -901,22 +681,6 @@ def query_database(
     Returns:
         Query results with success status, row count, and data
     """
-    from src.config import settings
-    
-    # Verify user exists in database - registered users only
-    user_data = user_service.get_user_by_username(username)
-    if not user_data:
-        return {
-            "success": False,
-            "error": f"User '{username}' not found. Only registered users can query the database.",
-        }
-    
-    # Check if user is disabled
-    if user_data.get("disabled", False):
-        return {
-            "success": False,
-            "error": f"User '{username}' is disabled.",
-        }
     
     # Enforce maximum row limit to prevent memory/context issues
     MAX_ALLOWED_ROWS = 10000
@@ -1152,250 +916,49 @@ def get_table_schema(table_name: str) -> dict[str, Any]:
         }
 
 
-
 # ============================================================================
-# API KEY MANAGEMENT TOOLS
+# CRM SYNC TOOLS
 # ============================================================================
 
 @mcp.tool()
-def generate_api_key(
-    admin_email: str,
-    admin_password: str,
-    name: str,
-    description: str = "",
-    expires_in_days: Optional[int] = None
+def sync_from_crm(
+    crm: str,
+    limit: int = 200,
 ) -> dict[str, Any]:
     """
-    Generate a new API key for authentication (admin only).
-    
-    ⚠️ ADMIN ONLY: Requires admin email and password to authenticate.
-    Admin credentials are verified against the Cloud SQL database.
-    ⚠️ IMPORTANT: The plaintext API key is only shown once during creation.
-    Store it securely - you won't be able to retrieve it again.
-    
+    Sync account data from a connected CRM (Salesforce or HubSpot) into the
+    local customers table.
+
+    Accounts are upserted by external ID so running this repeatedly is safe.
+    Configure credentials via environment variables before calling:
+
+    **Salesforce:** Set SALESFORCE_USERNAME, SALESFORCE_PASSWORD,
+    SALESFORCE_SECURITY_TOKEN (and optionally SALESFORCE_DOMAIN=test for sandboxes).
+
+    **HubSpot:** Set HUBSPOT_API_KEY.
+
     Args:
-        admin_email: Admin's email address (must exist in users table with admin=true)
-        admin_password: Admin's password
-        name: Friendly name for the API key (e.g., "LibreChat Production")
-        description: Optional description of the key's purpose
-        expires_in_days: Number of days until expiration (optional, null = never expires)
-    
+        crm: CRM to sync from — "salesforce" or "hubspot"
+        limit: Maximum number of accounts to pull (default 200, max 200)
+
     Returns:
-        API key information including the plaintext key (shown only once)
-    
+        Sync result with number of accounts upserted
+
     Example:
-        generate_api_key(
-            admin_email="admin@company.com",
-            admin_password="your_password",
-            name="LibreChat Production",
-            description="API key for LibreChat on Google Cloud Run",
-            expires_in_days=365
-        )
+        sync_from_crm(crm="salesforce")
+        sync_from_crm(crm="hubspot", limit=50)
     """
     try:
-        # Verify admin credentials against Cloud SQL database
-        admin_check = user_service.verify_admin(admin_email, admin_password)
-        if not admin_check["success"]:
-            return {
-                "success": False,
-                "error": admin_check.get("error", "Admin authentication failed")
-            }
-        
-        created_by = admin_check.get("username", admin_email)
-        
-        api_key_service = APIKeyService()
-        result = api_key_service.create_api_key(
-            name=name,
-            description=description,
-            created_by=created_by,
-            expires_in_days=expires_in_days
-        )
-        
-        return {
-            "success": True,
-            "message": "API key created successfully",
-            "api_key": result["api_key"],  # ⚠️ Only shown once!
-            "key_id": result["id"],
-            "key_prefix": result["key_prefix"],
-            "name": name,
-            "created_by": created_by,
-            "expires_at": result.get("expires_at"),
-            "warning": "⚠️ Store this API key securely! You won't be able to retrieve it again."
-        }
-    
-    except Exception as e:
+        from src.crm_service import get_crm_syncer
+        syncer = get_crm_syncer(crm)
+        return syncer.sync(limit=min(limit, 200))
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+    except Exception as exc:
         return {
             "success": False,
-            "error": f"Failed to generate API key: {str(e)}",
-            "error_type": type(e).__name__,
-        }
-
-
-@mcp.tool()
-def list_api_keys(
-    admin_email: str,
-    admin_password: str,
-    created_by: Optional[str] = None
-) -> dict[str, Any]:
-    """
-    List all API keys (admin only).
-    
-    ⚠️ ADMIN ONLY: Requires admin email and password to authenticate.
-    Admin credentials are verified against the Cloud SQL database.
-    
-    Note: The plaintext API key values are never returned for security.
-    Only the key prefix (first 8 characters) is shown for identification.
-    
-    Args:
-        admin_email: Admin's email address (must exist in users table with admin=true)
-        admin_password: Admin's password
-        created_by: Filter by creator username (optional, shows all if not specified)
-    
-    Returns:
-        List of API keys with metadata (excluding plaintext values)
-    
-    Example:
-        list_api_keys(admin_email="admin@company.com", admin_password="your_password")
-        list_api_keys(admin_email="admin@company.com", admin_password="your_password", created_by="admin")
-    """
-    try:
-        # Verify admin credentials against Cloud SQL database
-        admin_check = user_service.verify_admin(admin_email, admin_password)
-        if not admin_check["success"]:
-            return {
-                "success": False,
-                "error": admin_check.get("error", "Admin authentication failed")
-            }
-        
-        api_key_service = APIKeyService()
-        result = api_key_service.list_api_keys(created_by=created_by)
-        
-        if result["success"]:
-            keys = result["keys"]
-            return {
-                "success": True,
-                "count": len(keys),
-                "keys": keys,
-                "message": f"Found {len(keys)} API key(s)"
-            }
-        else:
-            return result
-    
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Failed to list API keys: {str(e)}",
-            "error_type": type(e).__name__,
-        }
-
-
-@mcp.tool()
-def revoke_api_key(
-    admin_email: str,
-    admin_password: str,
-    key_id: int
-) -> dict[str, Any]:
-    """
-    Revoke (deactivate) an API key without deleting it (admin only).
-    
-    ⚠️ ADMIN ONLY: Requires admin email and password to authenticate.
-    Admin credentials are verified against the Cloud SQL database.
-    
-    Revoked keys will fail authentication immediately but remain in the database
-    for audit purposes. This is safer than deleting keys.
-    
-    Args:
-        admin_email: Admin's email address (must exist in users table with admin=true)
-        admin_password: Admin's password
-        key_id: The ID of the API key to revoke
-    
-    Returns:
-        Confirmation of revocation
-    
-    Example:
-        revoke_api_key(admin_email="admin@company.com", admin_password="your_password", key_id=1)
-    """
-    try:
-        # Verify admin credentials against Cloud SQL database
-        admin_check = user_service.verify_admin(admin_email, admin_password)
-        if not admin_check["success"]:
-            return {
-                "success": False,
-                "error": admin_check.get("error", "Admin authentication failed")
-            }
-        
-        api_key_service = APIKeyService()
-        result = api_key_service.revoke_api_key(key_id=key_id)
-        
-        if result["success"]:
-            return {
-                "success": True,
-                "message": f"API key {key_id} has been revoked",
-                "key_id": key_id,
-                "revoked_at": result.get("revoked_at")
-            }
-        else:
-            return result
-    
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Failed to revoke API key: {str(e)}",
-            "error_type": type(e).__name__,
-        }
-
-
-@mcp.tool()
-def delete_api_key(
-    admin_email: str,
-    admin_password: str,
-    key_id: int
-) -> dict[str, Any]:
-    """
-    Permanently delete an API key from the database (admin only).
-    
-    ⚠️ ADMIN ONLY: Requires admin email and password to authenticate.
-    Admin credentials are verified against the Cloud SQL database.
-    ⚠️ WARNING: This action cannot be undone. Consider using revoke_api_key instead
-    to keep audit history.
-    
-    Args:
-        admin_email: Admin's email address (must exist in users table with admin=true)
-        admin_password: Admin's password
-        key_id: The ID of the API key to delete
-    
-    Returns:
-        Confirmation of deletion
-    
-    Example:
-        delete_api_key(admin_email="admin@company.com", admin_password="your_password", key_id=1)
-    """
-    try:
-        # Verify admin credentials against Cloud SQL database
-        admin_check = user_service.verify_admin(admin_email, admin_password)
-        if not admin_check["success"]:
-            return {
-                "success": False,
-                "error": admin_check.get("error", "Admin authentication failed")
-            }
-        
-        api_key_service = APIKeyService()
-        result = api_key_service.delete_api_key(key_id=key_id)
-        
-        if result["success"]:
-            return {
-                "success": True,
-                "message": f"API key {key_id} has been permanently deleted",
-                "key_id": key_id
-            }
-        else:
-            return result
-    
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Failed to delete API key: {str(e)}",
-            "error_type": type(e).__name__,
+            "error": f"CRM sync failed: {exc}",
+            "error_type": type(exc).__name__,
         }
 
 
@@ -1406,108 +969,855 @@ def main():
 
 def create_sse_app():
     """
-    Create an SSE (Server-Sent Events) app for HTTP/cloud deployment.
-    Use this for deploying to Google Cloud Run or other cloud platforms.
+    Create the SSE app for HTTP/Cloud Run deployment.
+
+    Authentication supports two schemes (checked in order):
+      1. OAuth 2.1 Bearer token  — Authorization: Bearer <token>
+      2. Legacy API key          — X-API-Key: <key>
+
+    OAuth 2.1 endpoints (unauthenticated, per MCP spec):
+      GET  /.well-known/oauth-authorization-server  — RFC8414 metadata
+      GET  /.well-known/oauth-protected-resource    — RFC9728 metadata
+      GET  /authorize                               — show login form
+      POST /authorize                               — submit credentials, issue code
+      POST /token                                   — exchange code / refresh token
+      POST /register                                — dynamic client registration (RFC7591)
+      POST /revoke                                  — token revocation
     """
-    from starlette.responses import JSONResponse, Response
-    from starlette.routing import Route
-    
-    # Configure transport security to allow Cloud Run host
-    # Disable DNS rebinding protection for cloud deployment
-    # In production, you should set allowed_hosts to your specific domain
     import os
+    import urllib.parse
+    from starlette.requests import Request
+    from starlette.responses import HTMLResponse, JSONResponse, Response
+    from starlette.routing import Route
     from mcp.server.transport_security import TransportSecuritySettings
-    
-    # Check if we're running in Cloud Run
-    cloud_run_service_url = os.environ.get('K_SERVICE')  # Cloud Run sets this
-    if cloud_run_service_url or os.environ.get('PORT'):
-        # In Cloud Run: disable DNS rebinding protection or allow all hosts
-        # For production, set allowed_hosts to your specific Cloud Run URL
+
+    # Disable DNS-rebinding protection in cloud environments
+    if os.environ.get("K_SERVICE") or os.environ.get("PORT"):
         mcp.settings.transport_security = TransportSecuritySettings(
             enable_dns_rebinding_protection=False
         )
-    
-    # Initialize API key service
+
     api_key_service = APIKeyService()
-    
-    # API Key Middleware - using raw ASGI to avoid issues with streaming responses
-    class APIKeyMiddleware:
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    # def _base_url(request: Request) -> str:
+    #     """Derive the OAuth base URL from the incoming request."""
+    #     # Respect X-Forwarded-Proto set by Cloud Run / reverse proxies
+    #     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    #     host = request.headers.get("x-forwarded-host", request.headers.get("host", "localhost:8000"))
+    #     return f"{proto}://{host}"
+
+    def _base_url(request: Request) -> str:
+        """Derive the OAuth base URL from the incoming request."""
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        host = request.headers.get("x-forwarded-host", request.headers.get("host", "localhost:8000"))
+        return f"{proto}://{host}"
+
+    def _public_base_url(request: Request) -> str:
+        """Base URL reachable by the end-user's browser (for authorization_endpoint).
+        Falls back to the request-derived URL if not set."""
+        override = os.getenv("OAUTH_PUBLIC_BASE_URL")
+        if override:
+            return override.rstrip("/")
+        return _base_url(request)
+
+    def _error(message: str, status: int = 400) -> JSONResponse:
+        return JSONResponse({"error": message}, status_code=status)
+
+    # ── OAuth 2.1 Endpoints ──────────────────────────────────────────────────
+
+    # async def oauth_server_metadata(request: Request) -> JSONResponse:
+    #     """RFC8414 — Authorization Server Metadata."""
+    #     return JSONResponse(oauth_service.get_server_metadata(_base_url(request)))
+
+    async def oauth_server_metadata(request: Request) -> JSONResponse:
+        """RFC8414 — Authorization Server Metadata."""
+        metadata = oauth_service.get_server_metadata(_base_url(request))
+        # Only override authorization_endpoint for browser access
+        public = _public_base_url(request)
+        metadata["authorization_endpoint"] = f"{public}/authorize"
+        return JSONResponse(metadata)
+
+    async def oauth_protected_resource(request: Request) -> JSONResponse:
+        """RFC9728 — Protected Resource Metadata."""
+        # Use _base_url (request-derived) NOT _public_base_url
+        # because LibreChat calls this server-to-server from inside Docker
+        return JSONResponse(oauth_service.get_protected_resource_metadata(_base_url(request)))
+
+    async def oauth_register(request: Request) -> JSONResponse:
+        """RFC7591 — Dynamic Client Registration."""
+        try:
+            body = await request.json()
+        except Exception:
+            return _error("Invalid JSON body")
+
+        redirect_uris = body.get("redirect_uris", [])
+        if not redirect_uris:
+            return _error("redirect_uris is required")
+
+        client_name = body.get("client_name", "MCP Client")
+        try:
+            result = oauth_service.register_client(
+                client_name=client_name,
+                redirect_uris=redirect_uris,
+                grant_types=body.get("grant_types"),
+                response_types=body.get("response_types"),
+                scope=body.get("scope"),
+                token_endpoint_auth_method=body.get("token_endpoint_auth_method", "none"),
+            )
+            return JSONResponse(result, status_code=201)
+        except ValueError as e:
+            return _error(str(e))
+        except Exception as e:
+            logger.error(f"Client registration failed: {e}")
+            return _error("Registration failed", 500)
+
+    # HTML login page served for GET /authorize
+    _LOGIN_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign In — Customer Success MCP</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; }}
+    body {{
+      margin: 0; display: flex; align-items: center; justify-content: center;
+      min-height: 100vh; background: #f0f2f5;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    .card {{
+      background: #fff; border-radius: 12px; padding: 2.5rem 2rem;
+      box-shadow: 0 4px 24px rgba(0,0,0,.10); width: 100%; max-width: 400px;
+    }}
+    h1 {{ margin: 0 0 .25rem; font-size: 1.4rem; color: #111; }}
+    p.sub {{ margin: 0 0 1.75rem; font-size: .9rem; color: #666; }}
+    label {{ display: block; font-size: .85rem; font-weight: 600;
+             color: #333; margin-bottom: .35rem; }}
+    input[type=text], input[type=password] {{
+      width: 100%; padding: .65rem .85rem; border: 1px solid #ddd;
+      border-radius: 8px; font-size: 1rem; outline: none;
+      transition: border-color .15s;
+    }}
+    input:focus {{ border-color: #4f46e5; }}
+    .field {{ margin-bottom: 1.1rem; }}
+    .error {{
+      background: #fef2f2; color: #b91c1c; border: 1px solid #fca5a5;
+      border-radius: 8px; padding: .65rem .85rem; font-size: .875rem;
+      margin-bottom: 1rem;
+    }}
+    button {{
+      width: 100%; padding: .75rem; background: #4f46e5; color: #fff;
+      border: none; border-radius: 8px; font-size: 1rem; font-weight: 600;
+      cursor: pointer; transition: background .15s;
+    }}
+    button:hover {{ background: #4338ca; }}
+    .scope-box {{
+      background: #f8f9ff; border: 1px solid #e0e7ff; border-radius: 8px;
+      padding: .65rem .85rem; font-size: .825rem; color: #4f46e5;
+      margin-bottom: 1.25rem;
+    }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>&#128274; Sign In</h1>
+    <p class="sub">Customer Success MCP Server</p>
+    {error_block}
+    {scope_block}
+    <form method="POST" action="/authorize">
+      <input type="hidden" name="client_id"             value="{client_id}">
+      <input type="hidden" name="redirect_uri"          value="{redirect_uri}">
+      <input type="hidden" name="state"                 value="{state}">
+      <input type="hidden" name="scope"                 value="{scope}">
+      <input type="hidden" name="code_challenge"        value="{code_challenge}">
+      <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
+      <div class="field">
+        <label for="username">Username</label>
+        <input id="username" type="text" name="username"
+               autocomplete="username" required autofocus>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" type="password" name="password"
+               autocomplete="current-password" required>
+      </div>
+      <button type="submit">Sign In</button>
+    </form>
+  </div>
+</body>
+</html>
+"""
+
+    async def oauth_authorize(request: Request):
+        """GET — show login form; POST — validate credentials, issue code, redirect."""
+        from src.auth import authenticate_user
+
+        if request.method == "GET":
+            params = dict(request.query_params)
+            logger.info(f"[OAUTH] GET /authorize params: {params}")
+            response_type = params.get("response_type", "code")  # OAuth 2.1 only supports "code"
+            client_id     = params.get("client_id", "")
+            redirect_uri  = params.get("redirect_uri", "")
+            state         = params.get("state", "")
+            scope         = params.get("scope", "read write")
+            code_challenge        = params.get("code_challenge", "")
+            code_challenge_method = params.get("code_challenge_method", "S256")
+
+            # Validate required params
+            if response_type != "code":
+                return _error("response_type must be 'code'")
+            if not client_id or not redirect_uri:
+                # ── Missing params: show a self-bootstrapping page ───────
+                # LibreChat or a browser may land here without query params.
+                # Render a page that does dynamic client registration + PKCE
+                # setup via JavaScript then redirects back with proper params.
+                # The PKCE verifier is encoded into the state param (base64 JSON)
+                # so it survives across tabs/windows without needing sessionStorage.
+                _pub = os.getenv("OAUTH_PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+                bootstrap_html = f"""<!DOCTYPE html>
+<html><head><title>Sign In — Customer Success MCP</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         display:flex; justify-content:center; align-items:center; min-height:100vh;
+         margin:0; background:#f0f2f5; color:#333; }}
+  .card {{ background:#fff; padding:2.5rem; border-radius:12px; box-shadow:0 4px 24px rgba(0,0,0,.1);
+           max-width:480px; width:90%; text-align:center; }}
+  h2 {{ margin-top:0; color:#1a73e8; }}
+  .status {{ margin:1.5rem 0; padding:1rem; border-radius:8px; background:#f8f9fa; font-size:.95rem; }}
+  .error {{ background:#fce8e6; color:#d93025; }}
+  .spinner {{ display:inline-block; width:20px; height:20px; border:3px solid #ddd;
+              border-top-color:#1a73e8; border-radius:50%; animation:spin .8s linear infinite; }}
+  @keyframes spin {{ to {{ transform:rotate(360deg); }} }}
+</style></head>
+<body><div class="card">
+  <h2>&#128274; Customer Success MCP</h2>
+  <div class="status" id="status"><span class="spinner"></span> Setting up secure connection&hellip;</div>
+</div>
+<script>
+function randomUUID() {{
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {{
+    try {{ return crypto.randomUUID(); }} catch(e) {{}}
+  }}
+  var buf = new Uint8Array(16);
+  crypto.getRandomValues(buf);
+  buf[6] = buf[6] & 0x0f | 0x40; buf[8] = buf[8] & 0x3f | 0x80;
+  var h = Array.from(buf, function(x){{ return ('0'+x.toString(16)).slice(-2); }}).join('');
+  return h.slice(0,8)+'-'+h.slice(8,12)+'-'+h.slice(12,16)+'-'+h.slice(16,20)+'-'+h.slice(20);
+}}
+
+(async function() {{
+  const S = document.getElementById('status');
+  const BASE = '{_pub}';
+  try {{
+    // 1. Dynamic Client Registration
+    S.innerHTML = '<span class="spinner"></span> Registering client&hellip;';
+    const regResp = await fetch(BASE + '/register', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{
+        client_name: 'MCP Browser Login',
+        redirect_uris: [BASE + '/authorize/callback', window.location.origin + '/oauth/callback', 'http://localhost:3080/oauth/callback'],
+        grant_types: ['authorization_code', 'refresh_token'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'none'
+      }})
+    }});
+    if (!regResp.ok) throw new Error('Registration failed: ' + await regResp.text());
+    const reg = await regResp.json();
+    const clientId = reg.client_id;
+
+    // 2. Generate PKCE challenge (server-side — works on any HTTP server)
+    S.innerHTML = '<span class="spinner"></span> Generating secure challenge&hellip;';
+    const pkceResp = await fetch(BASE + '/pkce-generate');
+    if (!pkceResp.ok) throw new Error('PKCE generation failed');
+    const pkce = await pkceResp.json();
+    const codeVerifier = pkce.code_verifier;
+    const codeChallenge = pkce.code_challenge;
+
+    // 3. Encode verifier + client info + auth_request_id into state
+    const redirectUri = BASE + '/authorize/callback';
+    const urlParams = new URLSearchParams(window.location.search);
+    const authRequestId = urlParams.get('auth_request_id') || '';
+    const statePayload = JSON.stringify({{
+      nonce: randomUUID(),
+      code_verifier: codeVerifier,
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      auth_request_id: authRequestId
+    }});
+    const stateB64 = btoa(statePayload).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');
+
+    // 4. Redirect to /authorize with proper params
+    S.innerHTML = '<span class="spinner"></span> Redirecting to login&hellip;';
+    const params = new URLSearchParams({{
+      response_type: 'code',
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      code_challenge: codeChallenge,
+      code_challenge_method: 'S256',
+      scope: 'read write',
+      state: stateB64
+    }});
+    window.location.href = BASE + '/authorize?' + params.toString();
+  }} catch(e) {{
+    S.className = 'status error';
+    S.textContent = '\\u274c ' + e.message;
+  }}
+}})();
+</script></body></html>"""
+                return HTMLResponse(bootstrap_html)
+
+            client = oauth_service.get_client(client_id)
+            if not client:
+                return _error("Unknown client_id", 400)
+            if redirect_uri not in client["redirect_uris"]:
+                return _error("redirect_uri not registered for this client", 400)
+
+            scope_block = f'<div class="scope-box">&#128274; Requesting access: <strong>{scope}</strong></div>' if scope else ""
+            html = _LOGIN_HTML.format(
+                client_id=client_id,
+                redirect_uri=redirect_uri,
+                state=state,
+                scope=scope,
+                code_challenge=code_challenge,
+                code_challenge_method=code_challenge_method,
+                error_block="",
+                scope_block=scope_block,
+            )
+            return HTMLResponse(html)
+
+        # POST — process login form
+        form = await request.form()
+        client_id             = form.get("client_id", "")
+        redirect_uri          = form.get("redirect_uri", "")
+        state                 = form.get("state", "")
+        scope                 = form.get("scope", "read write")
+        code_challenge        = form.get("code_challenge", "")
+        code_challenge_method = form.get("code_challenge_method", "S256")
+        username              = form.get("username", "")
+        password              = form.get("password", "")
+
+        def _show_error(msg: str):
+            scope_block = f'<div class="scope-box">&#128274; Requesting access: <strong>{scope}</strong></div>' if scope else ""
+            html = _LOGIN_HTML.format(
+                client_id=client_id,
+                redirect_uri=redirect_uri,
+                state=state,
+                scope=scope,
+                code_challenge=code_challenge,
+                code_challenge_method=code_challenge_method,
+                error_block=f'<div class="error">{msg}</div>',
+                scope_block=scope_block,
+            )
+            return HTMLResponse(html, status_code=401)
+
+        # Authenticate user
+        user = authenticate_user(username, password)
+        if not user:
+            return _show_error("Invalid username or password.")
+
+        # Fetch user ID from DB
+        try:
+            from src.user_service import UserService as _US
+            _us = _US()
+            user_dict = _us.get_user_by_username(username)
+            user_id = user_dict["id"]
+        except Exception as e:
+            logger.error(f"Could not fetch user ID for {username}: {e}")
+            return _show_error("Internal error. Please try again.")
+
+        # Create authorization code
+        try:
+            code = oauth_service.create_auth_code(
+                client_id=client_id,
+                user_id=user_id,
+                redirect_uri=redirect_uri,
+                scope=scope,
+                code_challenge=code_challenge,
+                code_challenge_method=code_challenge_method,
+            )
+        except Exception as e:
+            logger.error(f"Failed to create auth code: {e}")
+            return _show_error("Authorization failed. Please try again.")
+
+        # Redirect back to client
+        qs = urllib.parse.urlencode({"code": code, "state": state})
+        return Response(
+            status_code=302,
+            headers={"location": f"{redirect_uri}?{qs}"},
+        )
+
+    async def oauth_authorize_callback(request: Request):
+        """GET /authorize/callback — handle redirect after login, exchange code for token via JS."""
+        params = dict(request.query_params)
+        code = params.get("code", "")
+        state = params.get("state", "")
+        error = params.get("error", "")
+        _pub = os.getenv("OAUTH_PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+
+        callback_html = f"""<!DOCTYPE html>
+<html><head><title>Authenticating…</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         display:flex; justify-content:center; align-items:center; min-height:100vh;
+         margin:0; background:#f0f2f5; color:#333; }}
+  .card {{ background:#fff; padding:2.5rem; border-radius:12px; box-shadow:0 4px 24px rgba(0,0,0,.1);
+           max-width:500px; width:90%; text-align:center; }}
+  h2 {{ margin-top:0; color:#1a73e8; }}
+  .status {{ margin:1.5rem 0; padding:1rem; border-radius:8px; background:#f8f9fa; font-size:.95rem; word-break:break-all; }}
+  .error {{ background:#fce8e6; color:#d93025; }}
+  .success {{ background:#e6f4ea; color:#1e8e3e; }}
+  .token-box {{ text-align:left; background:#f8f9fa; padding:1rem; border-radius:8px; margin:1rem 0;
+                font-family:monospace; font-size:.85rem; word-break:break-all; max-height:200px; overflow-y:auto; }}
+  .spinner {{ display:inline-block; width:20px; height:20px; border:3px solid #ddd;
+              border-top-color:#1a73e8; border-radius:50%; animation:spin .8s linear infinite; }}
+  @keyframes spin {{ to {{ transform:rotate(360deg); }} }}
+  button {{ background:#1a73e8; color:#fff; border:none; padding:.75rem 1.5rem; border-radius:8px;
+           font-size:1rem; cursor:pointer; margin-top:1rem; }} button:hover {{ background:#1557b0; }}
+</style></head>
+<body><div class="card">
+  <h2>&#128274; Customer Success MCP</h2>
+  <div class="status" id="status"><span class="spinner"></span> Exchanging authorization code&hellip;</div>
+  <div id="result"></div>
+</div>
+<script>
+(async function() {{
+  const S = document.getElementById('status');
+  const R = document.getElementById('result');
+  const code = '{code}';
+  const error = '{error}';
+  const stateB64 = '{state}';
+  const BASE = '{_pub}';
+
+  if (error) {{
+    S.className = 'status error';
+    S.textContent = '\\u274c Authorization denied: ' + error;
+    return;
+  }}
+  if (!code) {{
+    S.className = 'status error';
+    S.textContent = '\\u274c No authorization code received.';
+    return;
+  }}
+
+  // Decode PKCE verifier and client info from state parameter
+  let codeVerifier, clientId, redirectUri;
+  try {{
+    // Restore base64url padding and decode
+    let b64 = stateB64.replace(/-/g,'+').replace(/_/g,'/');
+    while (b64.length % 4) b64 += '=';
+    const stateObj = JSON.parse(atob(b64));
+    codeVerifier = stateObj.code_verifier;
+    clientId = stateObj.client_id;
+    redirectUri = stateObj.redirect_uri;
+  }} catch(e) {{
+    S.className = 'status error';
+    S.textContent = '\\u274c Could not decode authentication state. Please start over.';
+    R.innerHTML = '<a href="' + BASE + '/authorize"><button>Try Again</button></a>';
+    return;
+  }}
+
+  if (!codeVerifier) {{
+    S.className = 'status error';
+    S.textContent = '\\u274c PKCE verifier not found in state. Please start over.';
+    R.innerHTML = '<a href="' + BASE + '/authorize"><button>Try Again</button></a>';
+    return;
+  }}
+
+  try {{
+    const resp = await fetch(BASE + '/token', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+      body: new URLSearchParams({{
+        grant_type: 'authorization_code',
+        code: code,
+        redirect_uri: redirectUri || (BASE + '/authorize/callback'),
+        client_id: clientId || '',
+        code_verifier: codeVerifier
+      }})
+    }});
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error_description || data.error || 'Token exchange failed');
+
+    // Auto-activate the MCP session via the auth_request_id
+    S.innerHTML = '<span class="spinner"></span> Activating session&hellip;';
+    let authRequestId = '';
+    try {{
+      let b64s = stateB64.replace(/-/g,'+').replace(/_/g,'/');
+      while (b64s.length % 4) b64s += '=';
+      const so = JSON.parse(atob(b64s));
+      authRequestId = so.auth_request_id || '';
+    }} catch(ignore) {{}}
+
+    const actResp = await fetch(BASE + '/complete-auth', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json', 'Authorization': 'Bearer ' + data.access_token}},
+      body: JSON.stringify({{ auth_request_id: authRequestId }})
+    }});
+    const actData = await actResp.json();
+
+    S.className = 'status success';
+    S.textContent = '\\u2705 Authentication successful!';
+    R.innerHTML = '<p style="font-size:1.1rem;margin-bottom:.5rem">Your session has been activated.</p>' +
+      '<p style="font-size:.95rem;color:#555">You can close this tab and return to the chat.<br>' +
+      'Just ask the AI to try again \\u2014 your tools are now unlocked.</p>' +
+      '<p style="font-size:.85rem;color:#999;margin-top:1rem">Signed in as: ' + (actData.username || 'user') + '</p>';
+  }} catch(e) {{
+    S.className = 'status error';
+    S.textContent = '\\u274c ' + e.message;
+    R.innerHTML = '<a href="' + BASE + '/authorize"><button>Try Again</button></a>';
+  }}
+}})();
+</script></body></html>"""
+        return HTMLResponse(callback_html)
+
+    async def oauth_pkce_generate(request: Request) -> JSONResponse:
+        """GET /pkce-generate — generate a PKCE code_verifier + code_challenge pair.
+
+        Moves SHA-256 hashing to the server so the browser JS doesn't need
+        crypto.subtle (which requires a Secure Context / HTTPS).
+        """
+        import hashlib, base64
+        code_verifier = secrets.token_urlsafe(32)  # ~43 chars, URL-safe
+        digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+        code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+        return JSONResponse({
+            "code_verifier": code_verifier,
+            "code_challenge": code_challenge,
+        })
+
+    async def oauth_complete_auth(request: Request) -> JSONResponse:
+        """POST /complete-auth — auto-activate an MCP session after OAuth login."""
+        # Require a valid Bearer token (just issued by /token)
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header.lower().startswith("bearer "):
+            return JSONResponse({"error": "Bearer token required"}, status_code=401)
+        token_info = oauth_service.validate_access_token(auth_header[7:].strip())
+        if not token_info:
+            return JSONResponse({"error": "Invalid or expired token"}, status_code=401)
+
+        username = token_info.get('username', token_info.get('sub', 'unknown'))
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        auth_request_id = body.get("auth_request_id", "")
+
+        if auth_request_id and auth_request_id in _pending_auth_requests:
+            pending = _pending_auth_requests[auth_request_id]
+            # Check TTL before accepting
+            if time.time() - pending.get('created_at', 0) > _PENDING_AUTH_REQUEST_TTL:
+                del _pending_auth_requests[auth_request_id]
+                return JSONResponse({"error": "Auth request expired. Please start over."}, status_code=400)
+            del _pending_auth_requests[auth_request_id]
+            session_key = pending['session_key']
+            # Store auth with weakref + timestamp
+            session_ref = pending.get('session_ref')  # weakref to session object
+            _session_auth[session_key] = {
+                'username': username,
+                'scopes': token_info.get('scopes', ['read', 'write']),
+                'session_auth': True,
+                'created_at': time.time(),
+                'session_ref': session_ref,
+            }
+            logger.info(f"[LAZY-AUTH] Session {session_key} auto-activated as {username} via auth_request_id {auth_request_id[:12]}...")
+            return JSONResponse({"success": True, "username": username, "message": "Session activated"})
+        else:
+            logger.warning(f"[LAZY-AUTH] /complete-auth called with invalid/missing auth_request_id: {auth_request_id[:20] if auth_request_id else '(empty)'}")
+            return JSONResponse(
+                {"error": "Invalid or expired auth_request_id. Please start the sign-in flow again from the chat."},
+                status_code=400,
+            )
+
+    async def oauth_token(request: Request) -> JSONResponse:
+        """POST /token — Authorization Code exchange and Refresh Token grant."""
+        try:
+            content_type = request.headers.get("content-type", "")
+            if "application/json" in content_type:
+                body = await request.json()
+            else:
+                form = await request.form()
+                body = dict(form)
+            logger.info(f"Token request: grant_type={body.get('grant_type')}")
+        except Exception:
+            return _error("Invalid request body")
+
+        grant_type = body.get("grant_type", "")
+
+        if grant_type == "authorization_code":
+            code          = body.get("code", "")
+            redirect_uri  = body.get("redirect_uri", "")
+            client_id     = body.get("client_id", "")  # optional — resolved from auth code if missing
+            code_verifier = body.get("code_verifier", "")
+
+            if not all([code, redirect_uri, code_verifier]):
+                return _error("code, redirect_uri and code_verifier are required")
+
+            try:
+                tokens = oauth_service.exchange_code(
+                    code=code,
+                    redirect_uri=redirect_uri,
+                    code_verifier=code_verifier,
+                    client_id=client_id or None,
+                )
+                return JSONResponse(tokens)
+            except ValueError as e:
+                return _error(str(e), 400)
+            except Exception as e:
+                logger.error(f"Token exchange error: {e}")
+                return _error("Token exchange failed", 500)
+
+        if grant_type == "refresh_token":
+            refresh_token = body.get("refresh_token", "")
+            client_id     = body.get("client_id", "")  # optional — resolved from token record if missing
+
+            if not refresh_token:
+                return _error("refresh_token is required")
+
+            try:
+                tokens = oauth_service.refresh_access_token(
+                    refresh_token=refresh_token,
+                    client_id=client_id or None,
+                )
+                return JSONResponse(tokens)
+            except ValueError as e:
+                return _error(str(e), 400)
+            except Exception as e:
+                logger.error(f"Token refresh error: {e}")
+                return _error("Token refresh failed", 500)
+
+        return _error(f"Unsupported grant_type: {grant_type}")
+
+    async def oauth_revoke(request: Request) -> JSONResponse:
+        """POST /revoke — Token revocation (RFC7009)."""
+        try:
+            form = await request.form()
+            token = form.get("token", "")
+        except Exception:
+            return _error("Invalid request")
+
+        if not token:
+            return _error("token is required")
+
+        oauth_service.revoke_token(token)
+        return JSONResponse({"revoked": True})
+
+    # ── Auth Middleware (LAZY AUTH) ─────────────────────────────────────────
+    # SSE connections, tool discovery, AND tool execution all pass through
+    # at the HTTP level. Auth is enforced inside each tool function instead,
+    # so the MCP protocol stays happy and the model gets a useful error
+    # message (not a transport-level 401 that triggers circuit breakers).
+
+    _PUBLIC_PATHS = {
+        "/", "/health", "/authorize", "/authorize/callback", "/token", "/register", "/revoke",
+        "/complete-auth", "/pkce-generate",
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/oauth-protected-resource",
+        "/sse",  # SSE connections are public for tool discovery
+    }
+
+    class AuthMiddleware:
+        """Lazy OAuth: all MCP traffic passes through. Auth is checked per-tool."""
+
         def __init__(self, app):
             self.app = app
-        
+
         async def __call__(self, scope, receive, send):
             if scope["type"] != "http":
                 await self.app(scope, receive, send)
                 return
-            
-            # Get path
+
             path = scope["path"]
-            
-            # Skip authentication for health check, root, and messages
-            if path in ["/health", "/"] or path.startswith("/messages"):
+
+            # Public paths — no processing needed
+            if path in _PUBLIC_PATHS:
                 await self.app(scope, receive, send)
                 return
-            
-            # For SSE endpoint, check API key
+
             headers = dict(scope.get("headers", []))
-            api_key = headers.get(b"x-api-key", b"").decode()
-            
-            if not api_key:
+
+            # If a Bearer token is present, validate it and set context
+            # so tool wrappers can check api_key_context later.
+            auth_header = headers.get(b"authorization", b"").decode()
+            if auth_header.lower().startswith("bearer "):
+                token_info = oauth_service.validate_access_token(auth_header[7:].strip())
+                if token_info:
+                    api_key_context.set(token_info)
+
+            # Let ALL /messages through — auth is enforced per-tool
+            if path.startswith("/messages"):
+                # Extract session_id from query string for session-based auth
+                qs = scope.get("query_string", b"").decode()
+                for part in qs.split("&"):
+                    if part.startswith("session_id="):
+                        sid = part.split("=", 1)[1]
+                        session_id_context.set(sid)
+                        # If this session was authenticated via the authenticate tool,
+                        # set api_key_context so all tools work
+                        if sid in _session_auth:
+                            api_key_context.set(_session_auth[sid])
+                        break
+                await self.app(scope, receive, send)
+                return
+
+            # Non-MCP, non-public paths still require a token
+            if api_key_context.get() is None:
+                _public_override = os.getenv("OAUTH_PUBLIC_BASE_URL", "").rstrip("/")
+                if _public_override:
+                    _base = _public_override
+                else:
+                    _proto = "https" if headers.get(b"x-forwarded-proto", b"").decode() == "https" else scope.get("scheme", "http")
+                    _host = headers.get(b"host", b"localhost").decode()
+                    _base = f"{_proto}://{_host}"
                 response = Response(
-                    content='{"error": "Missing X-API-Key header"}',
+                    content='{"error":"unauthorized","error_description":"A valid OAuth 2.1 Bearer token is required"}',
                     status_code=401,
-                    media_type="application/json"
+                    media_type="application/json",
+                    headers={"WWW-Authenticate": f'Bearer realm="Customer Success MCP", resource_metadata="{_base}/.well-known/oauth-protected-resource"'},
                 )
                 await response(scope, receive, send)
                 return
-            
-            # Validate API key
-            key_info = api_key_service.validate_api_key(api_key)
-            if not key_info:
-                response = Response(
-                    content='{"error": "Invalid or expired API key"}',
-                    status_code=401,
-                    media_type="application/json"
-                )
-                await response(scope, receive, send)
-                return
-            
-            # Store key info in context variable for use in tools
-            api_key_context.set(key_info)
-            
-            # Call the app
+
             await self.app(scope, receive, send)
-    
-    # Get the MCP SSE app
+
+    # ── Wrap every tool to enforce OAuth at the MCP level ────────────────────
+    # Instead of returning HTTP 401 (which trips circuit breakers), each tool
+    # checks api_key_context and returns a friendly tool-level error that the
+    # model can understand and act on.
+
+    _oauth_base = os.getenv("OAUTH_PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+
+    def _wrap_tool_with_auth(original_fn):
+        """Wrap a tool function to require auth (Bearer or session) before execution."""
+        import functools
+
+        def _is_authed():
+            """Check if current request has auth via Bearer token OR session auth."""
+            if api_key_context.get() is not None:
+                return True
+            # Check session auth using the MCP server session object.
+            try:
+                ctx = mcp.get_context()
+                session_key = id(ctx.session)
+                if session_key in _session_auth:
+                    info = _session_auth[session_key]
+                    # Check TTL
+                    if time.time() - info.get('created_at', 0) > _SESSION_AUTH_TTL:
+                        del _session_auth[session_key]
+                        logger.info(f"[LAZY-AUTH] Session {session_key} expired (TTL)")
+                        return False
+                    # Check weakref liveness
+                    ref = info.get('session_ref')
+                    if ref is not None and ref() is None:
+                        del _session_auth[session_key]
+                        logger.info(f"[LAZY-AUTH] Session {session_key} expired (object GC'd)")
+                        return False
+                    return True
+            except Exception:
+                pass
+            return False
+
+        def _make_auth_error():
+            """Generate an auth error with an auth_request_id linked to this session."""
+            # Periodically clean up stale entries
+            _cleanup_expired_auth()
+
+            auth_request_id = secrets.token_urlsafe(16)
+            try:
+                ctx = mcp.get_context()
+                session_obj = ctx.session
+                session_key = id(session_obj)
+                _pending_auth_requests[auth_request_id] = {
+                    'session_key': session_key,
+                    'session_ref': weakref.ref(session_obj),
+                    'created_at': time.time(),
+                }
+            except Exception:
+                pass
+            sign_in_url = f"{_oauth_base}/authorize?auth_request_id={auth_request_id}"
+            return {
+                "success": False,
+                "error": "authentication_required",
+                "message": (
+                    "🔐 Authentication is required before using this tool.\n\n"
+                    f"Please ask the user to open this link to sign in:\n{sign_in_url}\n\n"
+                    "Once they complete sign-in in the browser, their session will be "
+                    "automatically activated. Just try the tool again after they confirm "
+                    "they have signed in.\n\n"
+                    "You can also call 'check_auth_status' to verify the session is ready."
+                ),
+            }
+
+        @functools.wraps(original_fn)
+        def sync_wrapper(*args, **kwargs):
+            if not _is_authed():
+                logger.info(f"[LAZY-AUTH] Tool '{original_fn.__name__}' blocked — no auth")
+                return _make_auth_error()
+            return original_fn(*args, **kwargs)
+
+        @functools.wraps(original_fn)
+        async def async_wrapper(*args, **kwargs):
+            if not _is_authed():
+                logger.info(f"[LAZY-AUTH] Tool '{original_fn.__name__}' blocked — no auth")
+                return _make_auth_error()
+            return await original_fn(*args, **kwargs)
+
+        return async_wrapper if asyncio.iscoroutinefunction(original_fn) else sync_wrapper
+
+    # Tools that work WITHOUT authentication
+    _AUTH_EXEMPT_TOOLS = {'check_auth_status'}
+
+    # Patch all registered tools
+    if hasattr(mcp, '_tool_manager') and hasattr(mcp._tool_manager, '_tools'):
+        for tool_name, tool_obj in mcp._tool_manager._tools.items():
+            if tool_name in _AUTH_EXEMPT_TOOLS:
+                logger.info(f"[LAZY-AUTH] Tool '{tool_name}' — exempt from auth (activation-based)")
+            else:
+                tool_obj.fn = _wrap_tool_with_auth(tool_obj.fn)
+        logger.info(f"[LAZY-AUTH] Wrapped {len(mcp._tool_manager._tools)} tools with OAuth guard")
+
+    # ── Assemble app ─────────────────────────────────────────────────────────
     app = mcp.sse_app()
-    
-    # Add health check endpoint for Cloud Run
-    async def health_check(request):
+
+    async def health_check(request: Request) -> JSONResponse:
         return JSONResponse({
             "status": "healthy",
             "service": "customer-success-mcp",
-            "version": settings.server_version
+            "version": settings.server_version,
         })
-    
-    # Add root endpoint
-    async def root(request):
+
+    async def root(request: Request) -> JSONResponse:
         return JSONResponse({
             "service": "Customer Success MCP Server",
             "version": settings.server_version,
+            "auth": "OAuth 2.1 + PKCE (Bearer token required)",
             "endpoints": {
                 "sse": "/sse",
-                "messages": "/messages",
-                "health": "/health"
-            }
+                "health": "/health",
+                "oauth_metadata": "/.well-known/oauth-authorization-server",
+                "authorize": "/authorize",
+                "token": "/token",
+                "register": "/register",
+            },
         })
-    
-    # Add routes to the app BEFORE wrapping with middleware
+
     app.routes.insert(0, Route("/", root))
     app.routes.insert(0, Route("/health", health_check))
-    
-    # Wrap app with API key middleware AFTER adding routes
-    app = APIKeyMiddleware(app)
-    
+    app.routes.insert(0, Route("/.well-known/oauth-authorization-server", oauth_server_metadata))
+    app.routes.insert(0, Route("/.well-known/oauth-protected-resource",   oauth_protected_resource))
+    app.routes.insert(0, Route("/register", oauth_register,  methods=["POST"]))
+    app.routes.insert(0, Route("/token",    oauth_token,     methods=["POST"]))
+    app.routes.insert(0, Route("/revoke",   oauth_revoke,    methods=["POST"]))
+    app.routes.insert(0, Route("/complete-auth", oauth_complete_auth, methods=["POST"]))
+    app.routes.insert(0, Route("/pkce-generate", oauth_pkce_generate, methods=["GET"]))
+    app.routes.insert(0, Route("/authorize/callback", oauth_authorize_callback, methods=["GET"]))
+    app.routes.insert(0, Route("/authorize", oauth_authorize, methods=["GET", "POST"]))
+
+    app = AuthMiddleware(app)
     return app
 
 

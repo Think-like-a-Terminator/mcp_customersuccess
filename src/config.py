@@ -36,7 +36,34 @@ class Settings(BaseSettings):
     # Server
     server_name: str = "customer-success-mcp"
     server_version: str = "0.1.0"
-    
+
+    # Slack Notifications (optional)
+    slack_webhook_url: Optional[str] = None
+
+    # Salesforce CRM Integration (optional)
+    salesforce_username: Optional[str] = None
+    salesforce_password: Optional[str] = None
+    salesforce_security_token: Optional[str] = None
+    salesforce_domain: str = "login"  # use "test" for sandboxes
+
+    # HubSpot CRM Integration (optional)
+    hubspot_api_key: Optional[str] = None
+
+    @property
+    def slack_configured(self) -> bool:
+        """Check if Slack notifications are configured."""
+        return bool(self.slack_webhook_url)
+
+    @property
+    def salesforce_configured(self) -> bool:
+        """Check if Salesforce integration is configured."""
+        return bool(self.salesforce_username and self.salesforce_password and self.salesforce_security_token)
+
+    @property
+    def hubspot_configured(self) -> bool:
+        """Check if HubSpot integration is configured."""
+        return bool(self.hubspot_api_key)
+
     @property
     def smtp_configured(self) -> bool:
         """Check if SMTP is configured (host must be set)."""

@@ -397,6 +397,7 @@ class UserService:
         
         user = result["results"][0]
         return {
+            "id": user['id'],
             "username": user['username'],
             "email": user['email'],
             "full_name": user['full_name'],

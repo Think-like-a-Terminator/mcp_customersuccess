@@ -27,7 +27,6 @@ docker-compose up -d
 This starts:
 - MCP Server (port 8000)
 - PostgreSQL database (port 5432)
-- MailHog for email testing (SMTP: 1025, Web UI: 8025)
 
 2. **View logs:**
 ```bash
@@ -37,11 +36,6 @@ docker-compose logs -f mcp-server
 3. **Test the server:**
 ```bash
 curl http://localhost:8000/health
-```
-
-4. **Access MailHog UI:**
-```
-http://localhost:8025
 ```
 
 5. **Stop services:**
@@ -75,11 +69,6 @@ POSTGRES_PORT=5432
 POSTGRES_DB=customer_success
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=your-password
-
-# SMTP
-SMTP_HOST=mailhog
-SMTP_PORT=1025
-SMTP_FROM_EMAIL=reports@example.com
 
 # AWS (optional)
 AWS_ACCESS_KEY_ID=your-key
@@ -419,131 +408,12 @@ jobs:
 
 ---
 
-## Post-Deployment: API Key Setup
-
-After deploying, you need to set up API key authentication for secure multi-client access.
-
-### Step 1: Generate Bootstrap Admin API Key
-
-The first API key must be created with `created_by='admin'` to enable key management.
-
-**Option A: Use the bootstrap script (recommended)**
-```bash
-python bootstrap_admin_key.py
-```
-
-**Option B: Manual generation**
-```bash
-python -c "
-from src.api_key_service import APIKeyService
-service = APIKeyService()
-result = service.create_api_key(
-    name='Bootstrap Admin Key',
-    description='Initial admin key for key management',
-    created_by='admin'
-)
-print(f'Admin API Key: {result[\"api_key\"]}')
-"
-```
-
-⚠️ **Save this key securely!** You need it to generate additional API keys.
-
-### Step 2: Test Admin Key
-
-```bash
-# Test with your new admin key
-python test_cloud_api_key.py csm_live_YourAdminKeyHere
-```
-
-### Step 3: Generate Client API Keys
-
-Use MCP Inspector or Claude Desktop with your admin key to generate keys for clients:
-
-```bash
-# Launch MCP Inspector with admin key
-npx @modelcontextprotocol/inspector sse \
-  https://your-mcp-server-url.run.app/sse \
-  --header "X-API-Key: csm_live_YourAdminKeyHere"
-
-# Then use the generate_api_key tool
-```
-
-Or directly from Python (requires database access):
-```python
-from src.api_key_service import APIKeyService
-service = APIKeyService()
-
-# Note: Only works locally, use MCP tools for cloud deployment
-result = service.create_api_key(
-    name="LibreChat Production",
-    description="Key for LibreChat client",
-    created_by="admin"
-)
-print(result["api_key"])
-```
-
-### Step 4: Configure Clients
-
-Add the API key to your client configurations:
-
-**LibreChat:**
-```yaml
-MCP_SERVERS: |
-  {
-    "customer-success": {
-      "url": "https://your-mcp-server-url.run.app",
-      "transport": "sse",
-      "headers": {
-        "X-API-Key": "csm_live_YourClientKeyHere"
-      }
-    }
-  }
-```
-
-**Note**: Use a separate client API key (not your admin key) for LibreChat.
-
-**Claude Desktop:**
-```json
-{
-  "mcpServers": {
-    "customer-success": {
-      "url": "https://your-mcp-server-url.run.app",
-      "transport": "sse",
-      "headers": {
-        "X-API-Key": "csm_live_YourClientKeyHere"
-      }
-    }
-  }
-}
-```
-
-### Step 5: Test API Key Authentication
-
-```bash
-# Test without API key (should fail with 401)
-curl https://your-mcp-server-url.run.app/sse
-
-# Test with valid API key (should succeed)
-curl -H "X-API-Key: csm_live_YourAPIKeyHere" \
-     https://your-mcp-server-url.run.app/sse
-
-# Or use the automated test script
-python test_cloud_api_key.py csm_live_YourAPIKeyHere
-```
-
-For detailed API key setup, see **[API_KEY_SETUP.md](API_KEY_SETUP.md)**.
-
----
-
 ## Next Steps
 
-1. **Set up API key authentication** (see above)
-2. Set up monitoring and alerting
-3. Configure custom domain
-4. Set up CI/CD pipeline
-5. Configure backup strategy for Cloud SQL
-6. Set up Cloud CDN
-7. Implement user registration and verification
+1. Set up monitoring and alerting
+2. Configure a custom domain
+3. Set up a CI/CD pipeline (see GitHub Actions example above)
+4. Configure automated backups for Cloud SQL
+5. Bootstrap the initial admin user by connecting directly to the database via  and applying 
 
-For more information, see:
-- [API Key Setup Guide](API_KEY_SETUP.md)
+> **Admin operations** (user management, API key rotation) are performed out-of-band — directly against the database or via scripts in  — not through the MCP server.

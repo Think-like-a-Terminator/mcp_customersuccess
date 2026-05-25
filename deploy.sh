@@ -65,7 +65,6 @@ case $choice in
         echo ""
         echo "✅ Services started!"
         echo "   MCP Server: http://localhost:8000"
-        echo "   MailHog UI: http://localhost:8025"
         echo "   PostgreSQL: localhost:5432"
         echo ""
         echo "View logs: docker-compose logs -f"

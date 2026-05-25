@@ -1,7 +1,6 @@
 """Quick test script to verify all MCP tools are working."""
 
 from src.server import (
-    authenticate,
     create_call_to_action,
     list_call_to_actions,
     update_health_score,
@@ -16,16 +15,9 @@ def test_all_tools():
     print("=" * 60)
     print("Customer Success MCP Server - Tool Testing")
     print("=" * 60)
-    
-    # Test 1: Authentication
-    print("\n1️⃣  Testing Authentication...")
-    auth_result = authenticate("admin", "admin123")
-    print(f"   ✓ Authentication successful: {auth_result['success']}")
-    print(f"   ✓ User: {auth_result['user']['username']}")
-    print(f"   ✓ Scopes: {auth_result['user']['scopes']}")
-    
-    # Test 2: Create CTA
-    print("\n2️⃣  Testing Call to Action Creation...")
+
+    # Test 1: Create CTA
+    print("\n1️⃣  Testing Call to Action Creation...")
     cta_result = create_call_to_action(
         account_id="test-acct-001",
         title="Conduct Executive Business Review",
@@ -39,13 +31,13 @@ def test_all_tools():
     print(f"   ✓ CTA ID: {cta_result['cta']['id']}")
     print(f"   ✓ Priority: {cta_result['cta']['priority']}")
     
-    # Test 3: List CTAs
-    print("\n3️⃣  Testing CTA Listing...")
+    # Test 2: List CTAs
+    print("\n2️⃣  Testing CTA Listing...")
     list_result = list_call_to_actions(priority="high")
     print(f"   ✓ Found {list_result['count']} high-priority CTAs")
     
-    # Test 4: Update Health Score
-    print("\n4️⃣  Testing Health Score Update...")
+    # Test 3: Update Health Score
+    print("\n3️⃣  Testing Health Score Update...")
     health_result = update_health_score(
         account_id="test-acct-001",
         overall_score=82.5,
@@ -62,14 +54,14 @@ def test_all_tools():
     print(f"   ✓ Status: {health_result['health_score']['status']}")
     print(f"   ✓ Trend: {health_result['health_score']['trend']}")
     
-    # Test 5: Get Health Score
-    print("\n5️⃣  Testing Health Score Retrieval...")
+    # Test 4: Get Health Score
+    print("\n4️⃣  Testing Health Score Retrieval...")
     get_health = get_health_score("test-acct-001")
     print(f"   ✓ Retrieved health score: {get_health['success']}")
     print(f"   ✓ Number of metrics: {len(get_health['health_score']['metrics'])}")
     
-    # Test 6: Create Risk Alert
-    print("\n6️⃣  Testing Risk Alert Creation...")
+    # Test 5: Create Risk Alert
+    print("\n5️⃣  Testing Risk Alert Creation...")
     alert_result = create_risk_alert(
         account_id="test-acct-002",
         risk_level="high",
@@ -92,8 +84,8 @@ def test_all_tools():
     print(f"   ✓ Risk Level: {alert_result['alert']['risk_level']}")
     print(f"   ✓ Impact Score: {alert_result['alert']['impact_score']}")
     
-    # Test 7: List Risk Alerts
-    print("\n7️⃣  Testing Risk Alert Listing...")
+    # Test 6: List Risk Alerts
+    print("\n6️⃣  Testing Risk Alert Listing...")
     alerts_list = list_risk_alerts(risk_level="high")
     print(f"   ✓ Found {alerts_list['count']} high-risk alerts")
     
@@ -101,7 +93,6 @@ def test_all_tools():
     print("✅ All tests completed successfully!")
     print("=" * 60)
     print("\nThe MCP server is ready to use with:")
-    print("  • Authentication")
     print("  • Call to Actions (CTAs)")
     print("  • Health Score Tracking")
     print("  • Survey/NPS Emails (AWS SES)")
